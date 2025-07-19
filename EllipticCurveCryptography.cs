@@ -7,6 +7,7 @@ namespace EllipticCurveCryptography
     using Org.BouncyCastle.Asn1.Sec;
     using Org.BouncyCastle.Asn1.X9;
     using Org.BouncyCastle.Crypto;
+    using Org.BouncyCastle.Crypto.Agreement;
     using Org.BouncyCastle.Crypto.EC;
     using Org.BouncyCastle.Crypto.Generators;
     using Org.BouncyCastle.Crypto.Parameters;
@@ -25,9 +26,9 @@ namespace EllipticCurveCryptography
 
         public class KeyPairs
         {
-            public string? PrivateKey { get; set; } = string.Empty;
-            public string? PublicKeyX { get; set; } = string.Empty;
-            public string? PublicKeyY { get; set; } = string.Empty;
+            public string? PrivateKey { get; set; }
+            public string? PublicKeyX { get; set; }
+            public string? PublicKeyY { get; set; }
         }
 
         private KeyPairs? latestKeyPairs;
@@ -35,7 +36,7 @@ namespace EllipticCurveCryptography
         public class Signature
         {
             public BigInteger? R { get; set; }
-            public BigInteger? S { get; set; }
+            public BigInteger? s { get; set; }
         }
 
         private Signature? latestSignature;
@@ -43,16 +44,29 @@ namespace EllipticCurveCryptography
         private void EllipticCurveCryptography_Load(object sender, EventArgs e)
         {
             GbDigSign.Enabled = false;
+            GbHash.Enabled = false;
+            GbAlgo.Enabled = false;
+            CbAlgo.SelectedIndex = 0;
         }
 
-        public static KeyPairs GenerateKeyPair(string selectedCurve)
+        public static byte[] ComputeHash(string algorithm, byte[] data)
+        {
+            IDigest digest = DigestUtilities.GetDigest(algorithm);
+            digest.Reset();
+            digest.BlockUpdate(data, 0, data.Length);
+            byte[] result = new byte[digest.GetDigestSize()];
+            digest.DoFinal(result, 0);
+            return result;
+        }
+
+        public static KeyPairs GenerateKeyPairDSA(string selectedCurve)
         {
             X9ECParameters curve = CustomNamedCurves.GetByName(selectedCurve);
             ECDomainParameters domainParams = new ECDomainParameters(
-                curve.Curve, //selected curve
-                curve.G, // generator point
-                curve.N, // order of the curve
-                curve.H // cofactor
+                curve.Curve,
+                curve.G,
+                curve.N,
+                curve.H
             );
 
             var secureRandom = new SecureRandom();
@@ -61,7 +75,6 @@ namespace EllipticCurveCryptography
             keyGenerator.Init(keyGenParams);
 
             AsymmetricCipherKeyPair keyPair = keyGenerator.GenerateKeyPair();
-
             ECPrivateKeyParameters privateKey = (ECPrivateKeyParameters)keyPair.Private;
             ECPublicKeyParameters publicKey = (ECPublicKeyParameters)keyPair.Public;
             ECPoint q = publicKey.Q.Normalize();
@@ -72,6 +85,23 @@ namespace EllipticCurveCryptography
                 PublicKeyX = q.AffineXCoord.ToBigInteger().ToString(16),
                 PublicKeyY = q.AffineYCoord.ToBigInteger().ToString(16),
             };
+        }
+
+        public static AsymmetricCipherKeyPair GenerateKeyPairDH(string curveName)
+        {
+            X9ECParameters curve = CustomNamedCurves.GetByName(curveName);
+            ECDomainParameters domainParams = new ECDomainParameters(
+                curve.Curve,
+                curve.G,
+                curve.N,
+                curve.H
+            );
+
+            var keyGenParams = new ECKeyGenerationParameters(domainParams, new SecureRandom());
+            var generator = new ECKeyPairGenerator();
+            generator.Init(keyGenParams);
+
+            return generator.GenerateKeyPair();
         }
 
         public static string GenerateComponent(string selectedCurve)
@@ -91,10 +121,25 @@ namespace EllipticCurveCryptography
             return components;
         }
 
-        public static (BigInteger r, BigInteger s) SignData(
+        public static BigInteger CalculateSharedSecret(
+            AsymmetricKeyParameter privateKey,
+            AsymmetricKeyParameter publicKey
+        )
+        {
+            if (!(privateKey is ECPrivateKeyParameters))
+                throw new ArgumentException("Private key invalid");
+            if (!(publicKey is ECPublicKeyParameters))
+                throw new ArgumentException("Public key invalid");
+
+            var agreement = new ECDHBasicAgreement();
+            agreement.Init(privateKey);
+            return agreement.CalculateAgreement(publicKey);
+        }
+
+        public (BigInteger R, BigInteger s) SignData(
             string curveName,
             byte[] message,
-            BigInteger privateKeyD
+            BigInteger privateKey
         )
         {
             X9ECParameters curve = CustomNamedCurves.GetByName(curveName);
@@ -107,21 +152,22 @@ namespace EllipticCurveCryptography
                 curve.N,
                 curve.H
             );
-            ECPrivateKeyParameters privateKey = new ECPrivateKeyParameters(
-                privateKeyD,
+            ECPrivateKeyParameters privateKeyParams = new ECPrivateKeyParameters(
+                privateKey,
                 domainParams
             );
 
             var signer = new ECDsaSigner();
-            signer.Init(true, privateKey);
+            signer.Init(true, privateKeyParams);
 
-            var hash = message;
+            string hashAlgorithm = CbHash.SelectedItem?.ToString() ?? "SHA-256";
+            byte[] hash = ComputeHash(hashAlgorithm, message);
+
             var signature = signer.GenerateSignature(hash);
-
-            return (r: signature[0], s: signature[1]);
+            return (R: signature[0], s: signature[1]);
         }
 
-        public bool VerifySignature(string curveName, byte[] message)
+        public bool VerifySignature(string curveName, byte[] message, BigInteger R, BigInteger s)
         {
             X9ECParameters curve = CustomNamedCurves.GetByName(curveName);
             if (curve == null)
@@ -154,18 +200,53 @@ namespace EllipticCurveCryptography
             var signer = new ECDsaSigner();
             signer.Init(false, publicKey);
 
-            var hash = message;
+            string hashAlgorithm = CbHash.SelectedItem?.ToString() ?? "SHA-256";
+            byte[] hash = ComputeHash(hashAlgorithm, message);
+            return signer.VerifySignature(hash, R, s);
+        }
 
-            return signer.VerifySignature(hash, latestSignature?.R, latestSignature?.S);
+        public string GenerateSharedkey(string selectedCurve)
+        {
+            AsymmetricCipherKeyPair keyPairA = GenerateKeyPairDH(selectedCurve);
+            AsymmetricCipherKeyPair keyPairB = GenerateKeyPairDH(selectedCurve);
+
+            BigInteger sharedSecretA = CalculateSharedSecret(keyPairA.Private, keyPairB.Public);
+            BigInteger sharedSecretB = CalculateSharedSecret(keyPairB.Private, keyPairA.Public);
+
+            TxtPrivKey.Clear();
+            TxtPubKey.Clear();
+
+            TxtPrivKey.AppendText(
+                $"Private Key 1: {((ECPrivateKeyParameters)keyPairA.Private).D.ToString(16)}\r\n"
+                    + $"Private Key 2: {((ECPrivateKeyParameters)keyPairB.Private).D.ToString(16)}\r\n"
+            );
+
+            TxtPubKey.AppendText(
+                $"Public Key X1: {((ECPublicKeyParameters)keyPairA.Public).Q.AffineXCoord.ToBigInteger().ToString(16)}\r\n"
+                    + $"Public Key Y1: {((ECPublicKeyParameters)keyPairA.Public).Q.AffineYCoord.ToBigInteger().ToString(16)}\r\n\r\n"
+                    + $"Public Key X2: {((ECPublicKeyParameters)keyPairB.Public).Q.AffineXCoord.ToBigInteger().ToString(16)}\r\n"
+                    + $"Public Key Y2: {((ECPublicKeyParameters)keyPairB.Public).Q.AffineYCoord.ToBigInteger().ToString(16)}\r\n"
+            );
+
+            TxtComponents.AppendText(
+                $"Shared Secret A: {sharedSecretA.ToString(16)}\r\n\r\n"
+                    + $"Shared Secret B: {sharedSecretB.ToString(16)}\r\n"
+            );
+
+            if (sharedSecretA.Equals(sharedSecretB))
+            {
+                string sharedKey = sharedSecretA.ToString(16);
+                TxtComponents.AppendText("\r\nShared Key Valid" + Environment.NewLine);
+                return sharedKey;
+            }
+            else
+            {
+                throw new Exception("Shared keys do not match");
+            }
         }
 
         private void BtnGenerate_Click(object sender, EventArgs e)
         {
-            if (CbCurve.SelectedItem == null)
-            {
-                MessageBox.Show("Please select an algorithm.");
-                return;
-            }
             string? selectedCurve = CbCurve.SelectedItem?.ToString();
             if (string.IsNullOrEmpty(selectedCurve))
             {
@@ -175,15 +256,26 @@ namespace EllipticCurveCryptography
 
             try
             {
-                KeyPairs keyPairResult = GenerateKeyPair(selectedCurve);
+                TxtPrivKey.Clear();
+                TxtPubKey.Clear();
+
+                KeyPairs keyPairResult = GenerateKeyPairDSA(selectedCurve);
                 string componentResult = GenerateComponent(selectedCurve);
+
+                latestKeyPairs = new KeyPairs()
+                {
+                    PublicKeyX = keyPairResult.PublicKeyX,
+                    PublicKeyY = keyPairResult.PublicKeyY,
+                    PrivateKey = keyPairResult.PrivateKey,
+                };
 
                 TxtComponents.AppendText(componentResult + Environment.NewLine);
                 TxtPrivKey.Text = $"Private Key (d): {keyPairResult.PrivateKey}";
                 TxtPubKey.Text =
                     $"Public Key X: {keyPairResult.PublicKeyX}\r\nPublic Key Y: {keyPairResult.PublicKeyY}";
 
-                GbDigSign.Enabled = true;
+                GbHash.Enabled = true;
+                GbAlgo.Enabled = true;
             }
             catch (Exception ex)
             {
@@ -196,25 +288,35 @@ namespace EllipticCurveCryptography
         {
             try
             {
+                if (TxtMessage.Text == string.Empty)
+                {
+                    MessageBox.Show("Message is empty");
+                    return;
+                }
                 string message = TxtMessage.Text;
                 byte[] messageBytes = System.Text.Encoding.UTF8.GetBytes(message);
                 string? selectedCurve = CbCurve.SelectedItem?.ToString();
                 if (string.IsNullOrEmpty(selectedCurve))
                 {
-                    MessageBox.Show("Selected curve is invalid.");
+                    MessageBox.Show("Selected curve is invalid");
+                    return;
+                }
+                if (CbHash.SelectedIndex == -1)
+                {
+                    MessageBox.Show("Please select a hash algorithm");
                     return;
                 }
 
-                var (r, s) = SignData(
+                var (R, s) = SignData(
                     selectedCurve,
                     messageBytes,
                     new BigInteger(TxtPrivKey.Text.Split(':')[1].Trim(), 16)
                 );
 
-                latestSignature = new Signature() { R = r, S = s };
+                latestSignature = new Signature() { R = R, s = s };
 
                 TxtComponents.AppendText(
-                    $"r: {latestSignature.R?.ToString(16)}\r\n\r\ns: {latestSignature.S?.ToString(16)}"
+                    $"Signature (R,s):\r\n\r\nR: {latestSignature.R?.ToString(16)}\r\n\r\ns: {latestSignature.s?.ToString(16)}"
                         + Environment.NewLine
                 );
             }
@@ -232,10 +334,16 @@ namespace EllipticCurveCryptography
                 if (
                     latestSignature == null
                     || latestSignature.R == null
-                    || latestSignature.S == null
+                    || latestSignature.s == null
                 )
                 {
-                    MessageBox.Show("Signature belum ada, lakukan sign terlebih dahulu!");
+                    MessageBox.Show("Signature is not found");
+                    return;
+                }
+
+                if (CbHash.SelectedIndex == -1)
+                {
+                    MessageBox.Show("Please select a hash algorithm");
                     return;
                 }
 
@@ -244,20 +352,82 @@ namespace EllipticCurveCryptography
                 string? selectedCurve = CbCurve.SelectedItem?.ToString();
                 if (string.IsNullOrEmpty(selectedCurve))
                 {
-                    MessageBox.Show("Selected curve is invalid.");
+                    MessageBox.Show("Selected curve is invalid");
                     return;
                 }
 
-                VerifySignature(selectedCurve, messageBytes);
+                string rHex = TxtR.Text.Trim();
+                string sHex = TxtS.Text.Trim();
 
-                TxtComponents.AppendText(
-                    $"r: {latestSignature.R?.ToString(16)}\r\n\r\ns: {latestSignature.S?.ToString(16)}"
-                        + Environment.NewLine
-                );
+                BigInteger R = new BigInteger(rHex, 16);
+                BigInteger s = new BigInteger(sHex, 16);
+
+                bool verified = VerifySignature(selectedCurve, messageBytes, R, s);
+                if (verified)
+                {
+                    TxtComponents.AppendText("\r\nSignature is valid\r\n" + Environment.NewLine);
+                }
+                else
+                {
+                    TxtComponents.AppendText("\r\nSignature is invalid\r\n" + Environment.NewLine);
+                }
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"Error verifying: {ex.Message}");
+            }
+        }
+
+        private void BtnClear_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                TxtComponents.Clear();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error clearing: {ex.Message}");
+            }
+        }
+
+        private void CbAlgo_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (CbAlgo.SelectedItem?.ToString() == "None")
+            {
+                GbDigSign.Enabled = false;
+            }
+            else if (CbAlgo.SelectedItem?.ToString() == "ECDSA")
+            {
+                GbDigSign.Enabled = true;
+                GbSharedKey.Enabled = false;
+            }
+            else if (CbAlgo.SelectedItem?.ToString() == "ECDH")
+            {
+                GbDigSign.Enabled = false;
+                GbSharedKey.Enabled = true;
+            }
+            else
+            {
+                GbDigSign.Enabled = false;
+            }
+        }
+
+        private void BtnGenerateSharedKey_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                string? selectedCurve = CbCurve.SelectedItem?.ToString();
+                if (string.IsNullOrEmpty(selectedCurve))
+                {
+                    MessageBox.Show("Selected curve is invalid.");
+                    return;
+                }
+                string sharedKey = GenerateSharedkey(selectedCurve);
+                TxtSharedKey.Text = $"Shared Key: {sharedKey}";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error generating shared key: {ex.Message}");
             }
         }
     }
